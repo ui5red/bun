@@ -2,10 +2,11 @@
 
 This fork contains the Bun runtime-side changes needed to run the UI5 CLI end to end on Bun.
 
-Sibling fork references:
+Sibling repo references:
 
-- UI5 CLI fork: https://github.com/ui5red/cli
-- Local sibling checkout used during development: `../cli`
+- UI5 CLI fork: <https://github.com/ui5red/cli>
+- Validation app: <https://github.com/ui5red/ui5-cli-on-bun>
+- Local sibling checkouts used during development: `../cli` and `../ui5-cli-on-bun`
 
 ## What changed in this Bun fork
 
@@ -75,13 +76,16 @@ With this fork, Bun can now successfully host the HTTP/2 server path needed by t
 This fork provides the runtime support.
 The sibling UI5 CLI fork contains the CLI-side integration work:
 
-- local launcher scripts for the sibling Bun binary
 - JSDoc builder adjustments for Bun execution
 - server-side Bun-specific `ui5 serve --h2` integration
 
 See the sibling repo documentation for that side:
 
-- https://github.com/ui5red/cli/blob/main/ui5-cli-on-bun.md
+- <https://github.com/ui5red/cli/blob/main/ui5-cli-on-bun.md>
+
+The standalone validation app provides the user-facing setup and test flow:
+
+- <https://github.com/ui5red/ui5-cli-on-bun>
 
 ## Validation notes
 
@@ -91,3 +95,18 @@ Key validation performed against this fork:
 - raw `h2c` validation with an external Node HTTP/2 client
 - raw TLS `h2` validation with an external Node HTTP/2 client
 - end-to-end validation through the sibling UI5 CLI fork serving a real fixture app over HTTP/2
+
+## Recommended test flow
+
+Use the standalone validation app as the entry point for setup and testing:
+
+```sh
+git clone https://github.com/ui5red/ui5-cli-on-bun.git
+cd ui5-cli-on-bun
+npm install
+npm run setup:forks
+npm run bun:build:fork
+npm run smoke
+```
+
+That flow clones the sibling Bun and UI5 CLI forks automatically, prepares their dependencies, builds the custom Bun binary, and runs the end-to-end validation from one repository.
