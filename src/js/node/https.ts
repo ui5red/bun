@@ -1,6 +1,9 @@
 // Hardcoded module "node:https"
 const http = require("node:http");
+const { _connectionListener } = require("node:_http_server");
 const { urlToHttpOptions } = require("internal/url");
+
+const bunHttpsServerMarker = Symbol.for("::bun_https_server::");
 
 const ArrayPrototypeShift = Array.prototype.shift;
 const ObjectAssign = Object.assign;
@@ -44,11 +47,27 @@ function Agent(options) {
 $toClass(Agent, "Agent", http.Agent);
 Agent.prototype.createConnection = http.createConnection;
 
+function Server(options, requestListener) {
+  if (!(this instanceof Server)) return new Server(options, requestListener);
+
+  http.Server.$apply(this, [options, requestListener]);
+
+  if (this.listeners("secureConnection").length === 0) {
+    this.on("secureConnection", _connectionListener);
+  }
+}
+$toClass(Server, "Server", http.Server);
+Server.prototype[bunHttpsServerMarker] = true;
+
+function createServer(options, requestListener) {
+  return new Server(options, requestListener);
+}
+
 var https = {
   Agent,
   globalAgent: new Agent({ keepAlive: true, scheduling: "lifo", timeout: 5000 }),
-  Server: http.Server,
-  createServer: http.createServer,
+  Server,
+  createServer,
   get,
   request,
 };

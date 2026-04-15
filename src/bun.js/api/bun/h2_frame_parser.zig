@@ -196,6 +196,12 @@ const SettingsPayloadUnit = packed struct(u48) {
             std.mem.byteSwapAllFields(SettingsPayloadUnit, dst);
         }
     }
+
+    pub inline fn write(this: *const SettingsPayloadUnit, comptime Writer: type, writer: Writer) bool {
+        var swap = this.*;
+        std.mem.byteSwapAllFields(SettingsPayloadUnit, &swap);
+        return (writer.write(std.mem.asBytes(&swap)[0..SettingsPayloadUnit.byteSize]) catch 0) != 0;
+    }
 };
 
 const FullSettingsPayload = packed struct(u336) {
@@ -246,6 +252,49 @@ const FullSettingsPayload = packed struct(u336) {
         return (writer.write(std.mem.asBytes(&swap)[0..FullSettingsPayload.byteSize]) catch 0) != 0;
     }
 };
+
+fn settingsFramePayloadByteSize(is_server: bool) usize {
+    return if (is_server) FullSettingsPayload.byteSize - SettingsPayloadUnit.byteSize else FullSettingsPayload.byteSize;
+}
+
+fn writeSettingsFramePayload(settings: *const FullSettingsPayload, comptime Writer: type, writer: Writer, is_server: bool) bool {
+    if (!is_server) {
+        var mutable_settings = settings.*;
+        return mutable_settings.write(Writer, writer);
+    }
+
+    const header_table_size = SettingsPayloadUnit{
+        .type = @intFromEnum(SettingsType.SETTINGS_HEADER_TABLE_SIZE),
+        .value = settings.headerTableSize,
+    };
+    const max_concurrent_streams = SettingsPayloadUnit{
+        .type = @intFromEnum(SettingsType.SETTINGS_MAX_CONCURRENT_STREAMS),
+        .value = settings.maxConcurrentStreams,
+    };
+    const initial_window_size = SettingsPayloadUnit{
+        .type = @intFromEnum(SettingsType.SETTINGS_INITIAL_WINDOW_SIZE),
+        .value = settings.initialWindowSize,
+    };
+    const max_frame_size = SettingsPayloadUnit{
+        .type = @intFromEnum(SettingsType.SETTINGS_MAX_FRAME_SIZE),
+        .value = settings.maxFrameSize,
+    };
+    const max_header_list_size = SettingsPayloadUnit{
+        .type = @intFromEnum(SettingsType.SETTINGS_MAX_HEADER_LIST_SIZE),
+        .value = settings.maxHeaderListSize,
+    };
+    const enable_connect_protocol = SettingsPayloadUnit{
+        .type = @intFromEnum(SettingsType.SETTINGS_ENABLE_CONNECT_PROTOCOL),
+        .value = settings.enableConnectProtocol,
+    };
+
+    return header_table_size.write(Writer, writer) and
+        max_concurrent_streams.write(Writer, writer) and
+        initial_window_size.write(Writer, writer) and
+        max_frame_size.write(Writer, writer) and
+        max_header_list_size.write(Writer, writer) and
+        enable_connect_protocol.write(Writer, writer);
+}
 
 const ValidResponsePseudoHeaders = bun.ComptimeStringMap(void, .{
     .{":status"},
@@ -1285,15 +1334,15 @@ pub const H2FrameParser = struct {
             .type = @intFromEnum(FrameType.HTTP_FRAME_SETTINGS),
             .flags = 0,
             .streamIdentifier = 0,
-            .length = FullSettingsPayload.byteSize,
+            .length = @intCast(settingsFramePayloadByteSize(this.isServer)),
         };
         _ = settingsHeader.write(@TypeOf(writer), writer);
 
         this.outstandingSettings += 1;
 
         this.localSettings = settings;
-        _ = this.localSettings.write(@TypeOf(writer), writer);
-        _ = this.write(&buffer);
+        _ = writeSettingsFramePayload(&this.localSettings, @TypeOf(writer), writer, this.isServer);
+        _ = this.write(stream.getWritten());
         return true;
     }
 
@@ -1456,12 +1505,12 @@ pub const H2FrameParser = struct {
             .type = @intFromEnum(FrameType.HTTP_FRAME_SETTINGS),
             .flags = 0,
             .streamIdentifier = 0,
-            .length = FullSettingsPayload.byteSize,
+            .length = @intCast(settingsFramePayloadByteSize(this.isServer)),
         };
         this.outstandingSettings += 1;
         _ = settingsHeader.write(@TypeOf(writer), writer);
-        _ = this.localSettings.write(@TypeOf(writer), writer);
-        _ = this.write(&preface_buffer);
+        _ = writeSettingsFramePayload(&this.localSettings, @TypeOf(writer), writer, this.isServer);
+        _ = this.write(preface_stream.getWritten());
     }
 
     pub fn sendSettingsACK(this: *H2FrameParser) void {

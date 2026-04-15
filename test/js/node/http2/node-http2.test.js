@@ -1385,6 +1385,106 @@ for (const nodeExecutable of [nodeExe(), bunExe()]) {
   }
 }
 
+it("secure server should serialize initial SETTINGS frames without trailing bytes", async () => {
+  const server = http2.createSecureServer({ ...TLS_CERT, allowHTTP1: false });
+  const { promise: listening, resolve: onListening } = Promise.withResolvers();
+  server.listen(0, () => onListening());
+  await listening;
+
+  const { port } = server.address();
+
+  try {
+    const frames = await new Promise((resolve, reject) => {
+      const socket = tls.connect({
+        host: "localhost",
+        port,
+        rejectUnauthorized: false,
+        ALPNProtocols: ["h2"],
+      });
+
+      const chunks = [];
+      let receivedBytes = 0;
+      let settled = false;
+
+      const finish = callback => value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        socket.off("secureConnect", onSecureConnect);
+        socket.off("data", onData);
+        socket.off("error", onError);
+        callback(value);
+      };
+
+      const resolveOnce = finish(buffer => {
+        socket.end();
+        resolve(buffer);
+      });
+      const rejectOnce = finish(error => {
+        socket.destroy();
+        reject(error);
+      });
+
+      const timeout = setTimeout(() => {
+        rejectOnce(new Error(`Timed out waiting for initial HTTP/2 settings frames (${receivedBytes} bytes received)`));
+      }, 5000 * ASAN_MULTIPLIER);
+
+      const onSecureConnect = () => {
+        try {
+          expect(socket.alpnProtocol).toBe("h2");
+        } catch (error) {
+          rejectOnce(error);
+          return;
+        }
+
+        socket.write(Buffer.concat([http2utils.kClientMagic, new http2utils.SettingsFrame().data]));
+      };
+
+      const onData = chunk => {
+        chunks.push(chunk);
+        receivedBytes += chunk.length;
+
+        if (receivedBytes >= 54) {
+          resolveOnce(Buffer.concat(chunks, receivedBytes));
+        }
+      };
+
+      const onError = error => {
+        rejectOnce(error);
+      };
+
+      socket.on("secureConnect", onSecureConnect);
+      socket.on("data", onData);
+      socket.on("error", onError);
+    });
+
+    const firstFrameLength = frames.readUIntBE(0, 3);
+    expect(firstFrameLength).toBe(36);
+    expect(frames[3]).toBe(4);
+    expect(frames[4]).toBe(0);
+    expect(frames.readUInt32BE(5) & 0x7fffffff).toBe(0);
+
+    const firstPayload = frames.subarray(9, 45);
+    expect(firstPayload.byteLength).toBe(36);
+
+    const settingsIds = [];
+    for (let offset = 0; offset < firstPayload.length; offset += 6) {
+      settingsIds.push(firstPayload.readUInt16BE(offset));
+    }
+
+    expect(settingsIds).toEqual([1, 3, 4, 5, 6, 8]);
+    expect(settingsIds.includes(2)).toBe(false);
+    expect(frames.subarray(45, 54)).toEqual(new http2utils.SettingsFrame(true).data);
+  } finally {
+    await new Promise((resolve, reject) => {
+      server.close(error => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+});
+
 it("sensitive headers should work", async () => {
   const server = http2.createServer();
   let client;

@@ -2934,6 +2934,17 @@ JSValue createCryptoX509Object(JSGlobalObject* globalObject)
     return cryptoX509;
 }
 
+JSValue createStreamWrapObject(JSGlobalObject* globalObject)
+{
+    auto& vm = JSC::getVM(globalObject);
+    auto streamWrap = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 2);
+    auto streamBaseState = JSC::constructEmptyArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), 1);
+    streamBaseState->putDirectIndex(globalObject, 0, JSC::jsNumber(0));
+    streamWrap->putDirect(vm, JSC::Identifier::fromString(vm, "kReadBytesOrError"_s), JSC::jsNumber(0), 0);
+    streamWrap->putDirect(vm, JSC::Identifier::fromString(vm, "streamBaseState"_s), streamBaseState, 0);
+    return streamWrap;
+}
+
 JSC_DEFINE_HOST_FUNCTION(Process_functionBinding, (JSGlobalObject * jsGlobalObject, CallFrame* callFrame))
 {
     auto& vm = JSC::getVM(jsGlobalObject);
@@ -2963,7 +2974,7 @@ JSC_DEFINE_HOST_FUNCTION(Process_functionBinding, (JSGlobalObject * jsGlobalObje
     if (moduleName == "process_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED("process_wrap");
     if (moduleName == "signal_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED("signal_wrap");
     if (moduleName == "spawn_sync"_s) PROCESS_BINDING_NOT_IMPLEMENTED("spawn_sync");
-    if (moduleName == "stream_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED_ISSUE("stream_wrap", "4957");
+    if (moduleName == "stream_wrap"_s) return JSValue::encode(createStreamWrapObject(globalObject));
     if (moduleName == "tcp_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED("tcp_wrap");
     if (moduleName == "tls_wrap"_s) PROCESS_BINDING_NOT_IMPLEMENTED("tls_wrap");
     if (moduleName == "tty_wrap"_s) return JSValue::encode(Bun::createNodeTTYWrapObject(globalObject));

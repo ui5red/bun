@@ -239,6 +239,8 @@ function parseCertString() {
 
 const rejectUnauthorizedDefault =
   process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0" && process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "false";
+const bunHttpsServerMarker = Symbol.for("::bun_https_server::");
+const ObjectPrototypeIsPrototypeOf = Object.prototype.isPrototypeOf;
 
 function unfqdn(host) {
   return RegExpPrototypeSymbolReplace.$call(/[.]$/, host, "");
@@ -845,6 +847,11 @@ function Server(options, secureConnectionListener): void {
   this.setSecureContext(options);
 }
 $toClass(Server, "Server", NetServer);
+Object.defineProperty(Server, Symbol.hasInstance, {
+  value(instance) {
+    return !!instance?.[bunHttpsServerMarker] || ObjectPrototypeIsPrototypeOf.$call(this.prototype, instance);
+  },
+});
 
 function createServer(options, connectionListener) {
   return new Server(options, connectionListener);
