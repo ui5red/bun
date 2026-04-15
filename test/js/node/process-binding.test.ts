@@ -27,4 +27,16 @@ describe("process.binding", () => {
     expect(map).toBeDefined();
     expect(map.get(uv.UV_EISCONN)).toEqual(["EISCONN", "socket is already connected"]);
   });
+
+  test("process.binding('stream_wrap')", () => {
+    /* @ts-ignore */
+    const streamWrap = process.binding("stream_wrap");
+    expect(streamWrap).toBeDefined();
+    expect(streamWrap).toHaveProperty("kReadBytesOrError", 0);
+    expect(streamWrap).toHaveProperty("streamBaseState");
+    expect(Array.isArray(streamWrap.streamBaseState)).toBe(true);
+
+    streamWrap.streamBaseState[streamWrap.kReadBytesOrError] = 123;
+    expect(streamWrap.streamBaseState[0]).toBe(123);
+  });
 });

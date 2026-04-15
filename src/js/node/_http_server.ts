@@ -5,9 +5,16 @@ const {
   _checkInvalidHeaderChar: checkInvalidHeaderChar,
   validateHeaderName,
   validateHeaderValue,
+  freeParser,
+  HTTPParser,
+  isLenient,
+  kIncomingMessage,
+  parsers,
+  prepareError,
 } = require("node:_http_common");
 const { validateObject, validateLinkHeaderValue, validateBoolean, validateInteger } = require("internal/validators");
 const { ConnResetException } = require("internal/shared");
+const { convertALPNProtocols } = require("node:tls");
 
 const { isPrimary } = require("internal/cluster/isPrimary");
 const { throwOnInvalidTLSArray } = require("internal/tls");
@@ -54,7 +61,6 @@ const { format } = require("internal/util/inspect");
 
 const { IncomingMessage } = require("node:_http_incoming");
 const { OutgoingMessage } = require("node:_http_outgoing");
-const { kIncomingMessage } = require("node:_http_common");
 const kConnectionsCheckingInterval = Symbol("http.server.connectionsCheckingInterval");
 
 const getBunServerAllClosedPromise = $newZigFunction("node_http_binding.zig", "getBunServerAllClosedPromise", 1);
@@ -197,6 +203,67 @@ function emitListeningNextTick(self, hostname, port) {
   }
 }
 
+function socketOnCompatError(error) {
+  this.destroy(error);
+}
+
+function socketOnCompatClose(socket) {
+  freeParser(socket.parser, null, socket);
+}
+
+function socketOnCompatEnd(_server, socket, parser) {
+  const result = parser.finish();
+  if (result instanceof Error) {
+    prepareError(result, parser);
+    socketOnCompatError.$call(socket, result);
+  }
+}
+
+function socketOnCompatData(_server, socket, parser, chunk) {
+  const result = parser.execute(chunk);
+  if (result instanceof Error) {
+    prepareError(result, parser, chunk);
+    socketOnCompatError.$call(socket, result);
+  }
+}
+
+function parserOnIncomingCompat(server, socket, req) {
+  const ResponseClass = server[optionsSymbol].ServerResponse || ServerResponse;
+  const response = new ResponseClass(req, {
+    highWaterMark: socket.writableHighWaterMark,
+    rejectNonStandardBodyWrites: server.rejectNonStandardBodyWrites,
+  });
+  req.socket = socket;
+  response.assignSocket(socket);
+  server.emit("request", req, response);
+  return 0;
+}
+
+function connectionListener(socket) {
+  const server = this;
+  socket.server = server;
+
+  const parser = parsers.alloc();
+  parser.initialize(
+    HTTPParser.REQUEST,
+    undefined,
+    server.maxHeaderSize || 0,
+    isLenient() ? HTTPParser.kLenientAll : HTTPParser.kLenientNone,
+  );
+  parser.socket = socket;
+  socket.parser = parser;
+
+  if (typeof server.maxHeadersCount === "number") {
+    parser.maxHeaderPairs = server.maxHeadersCount << 1;
+  }
+
+  parser.onIncoming = parserOnIncomingCompat.bind(undefined, server, socket);
+  socket.ondata = socketOnCompatData.bind(undefined, server, socket, parser);
+  socket.on("end", socketOnCompatEnd.bind(undefined, server, socket, parser));
+  socket.on("close", socketOnCompatClose.bind(undefined, socket));
+  socket.on("error", socketOnCompatError);
+}
+
 function Server(options, callback): void {
   if (!(this instanceof Server)) return new Server(options, callback);
   EventEmitter.$call(this);
@@ -250,15 +317,21 @@ function Server(options, callback): void {
       throw $ERR_INVALID_ARG_TYPE("options.secureOptions", "number", secureOptions);
     }
 
+    const tlsOptions = {
+      serverName,
+      key,
+      cert,
+      ca,
+      passphrase,
+      secureOptions,
+    };
+
+    if (options.ALPNProtocols) {
+      convertALPNProtocols(options.ALPNProtocols, tlsOptions);
+    }
+
     if (this[isTlsSymbol]) {
-      this[tlsSymbol] = {
-        serverName,
-        key,
-        cert,
-        ca,
-        passphrase,
-        secureOptions,
-      };
+      this[tlsSymbol] = tlsOptions;
     } else {
       this[tlsSymbol] = null;
     }
@@ -1904,6 +1977,7 @@ function ensureReadableStreamController(run) {
 }
 
 export default {
+  _connectionListener: connectionListener,
   Server,
   ServerResponse,
   kConnectionsCheckingInterval,
