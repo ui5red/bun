@@ -849,7 +849,7 @@ function Server(options, secureConnectionListener): void {
 $toClass(Server, "Server", NetServer);
 Object.defineProperty(Server, Symbol.hasInstance, {
   value(instance) {
-    return !!instance?.[bunHttpsServerMarker] || ObjectPrototypeIsPrototypeOf.$call(this.prototype, instance);
+    return instance?.[bunHttpsServerMarker] || ObjectPrototypeIsPrototypeOf.$call(this.prototype, instance);
   },
 });
 

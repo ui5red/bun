@@ -2939,8 +2939,8 @@ JSValue createStreamWrapObject(JSGlobalObject* globalObject)
 {
     auto& vm = JSC::getVM(globalObject);
     auto streamWrap = JSC::constructEmptyObject(globalObject, globalObject->objectPrototype(), 2);
-    auto streamBaseState = JSC::constructEmptyArray(globalObject, static_cast<JSC::ArrayAllocationProfile*>(nullptr), 1);
-    streamBaseState->putDirectIndex(globalObject, 0, JSC::jsNumber(0));
+    // Use Uint8Array to match Node.js behavior (Node uses a Uint8Array for streamBaseState)
+    auto* streamBaseState = JSC::JSUint8Array::create(globalObject, globalObject->m_typedArrayUint8.get(globalObject), 1);
     streamWrap->putDirect(vm, JSC::Identifier::fromString(vm, "kReadBytesOrError"_s), JSC::jsNumber(0), 0);
     streamWrap->putDirect(vm, JSC::Identifier::fromString(vm, "streamBaseState"_s), streamBaseState, 0);
     return streamWrap;

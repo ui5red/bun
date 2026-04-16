@@ -34,7 +34,9 @@ describe("process.binding", () => {
     expect(streamWrap).toBeDefined();
     expect(streamWrap).toHaveProperty("kReadBytesOrError", 0);
     expect(streamWrap).toHaveProperty("streamBaseState");
-    expect(Array.isArray(streamWrap.streamBaseState)).toBe(true);
+    expect(streamWrap.streamBaseState).toBeInstanceOf(Uint8Array);
+    expect(streamWrap.streamBaseState.length).toBe(1);
+    expect(streamWrap.streamBaseState[0]).toBe(0);
 
     streamWrap.streamBaseState[streamWrap.kReadBytesOrError] = 123;
     expect(streamWrap.streamBaseState[0]).toBe(123);

@@ -253,10 +253,16 @@ const FullSettingsPayload = packed struct(u336) {
     }
 };
 
+// Keep in sync with FullSettingsPayload.
+// Server mode omits SETTINGS_ENABLE_PUSH (RFC 9113 Section 6.5.2),
+// so the byte size is FullSettingsPayload.byteSize minus one SettingsPayloadUnit.
 fn settingsFramePayloadByteSize(is_server: bool) usize {
     return if (is_server) FullSettingsPayload.byteSize - SettingsPayloadUnit.byteSize else FullSettingsPayload.byteSize;
 }
 
+// Keep in sync with FullSettingsPayload.
+// Server mode writes each setting individually, skipping SETTINGS_ENABLE_PUSH
+// (servers MUST NOT send this per RFC 9113 Section 6.5.2).
 fn writeSettingsFramePayload(settings: *const FullSettingsPayload, comptime Writer: type, writer: Writer, is_server: bool) bool {
     if (!is_server) {
         var mutable_settings = settings.*;
