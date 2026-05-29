@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from "fs";
-import { tls as cert1 } from "harness";
+import { tls as cert1, isDebug } from "harness";
 import { AddressInfo } from "net";
 import { createTest } from "node-harness";
 import { once } from "node:events";
@@ -421,8 +421,12 @@ describe("tls.createServer events", () => {
 
     server.on("error", closeAndFail);
 
-    //should be faster than 100ms
-    timeout = setTimeout(closeAndFail, 100);
+    // First `Bun.connect({tls:true})` of the process triggers the once-only
+    // bundled-root-store build (`us_get_shared_default_ca_store`, ~150 ms in
+    // debug+ASAN) so SSL_get_verify_result is real instead of the false
+    // X509_V_OK VERIFY_NONE used to report. The condition assertion is the
+    // point; the old 100 ms was a perf claim that is now load-order-dependent.
+    timeout = setTimeout(closeAndFail, isDebug ? 2000 : 500);
 
     server.listen(
       mustCall(async () => {
@@ -469,8 +473,12 @@ describe("tls.createServer events", () => {
     };
     server.on("error", closeAndFail);
 
-    //should be faster than 100ms
-    timeout = setTimeout(closeAndFail, 100);
+    // First `Bun.connect({tls:true})` of the process triggers the once-only
+    // bundled-root-store build (`us_get_shared_default_ca_store`, ~150 ms in
+    // debug+ASAN) so SSL_get_verify_result is real instead of the false
+    // X509_V_OK VERIFY_NONE used to report. The condition assertion is the
+    // point; the old 100 ms was a perf claim that is now load-order-dependent.
+    timeout = setTimeout(closeAndFail, isDebug ? 2000 : 500);
 
     server.listen(
       mustCall(async () => {
@@ -621,8 +629,12 @@ describe("tls.createServer events", () => {
 
     server.on("error", closeAndFail);
 
-    //should be faster than 100ms
-    timeout = setTimeout(closeAndFail, 100);
+    // First `Bun.connect({tls:true})` of the process triggers the once-only
+    // bundled-root-store build (`us_get_shared_default_ca_store`, ~150 ms in
+    // debug+ASAN) so SSL_get_verify_result is real instead of the false
+    // X509_V_OK VERIFY_NONE used to report. The condition assertion is the
+    // point; the old 100 ms was a perf claim that is now load-order-dependent.
+    timeout = setTimeout(closeAndFail, isDebug ? 2000 : 500);
 
     server.listen(
       mustCall(async () => {
@@ -709,4 +721,76 @@ it("connectionListener should emit the right amount of times, and with alpnProto
 
   await Promise.all(promises);
   expect(count).toBe(50);
+});
+
+it("leaves socket.authorized false unless a client certificate was requested and verified", async () => {
+  // A server that never requested a client certificate must not report the
+  // connection as authorized (matches Node.js fail-closed semantics).
+  {
+    const { promise, resolve, reject } = Promise.withResolvers<boolean>();
+    const server: Server = createServer(COMMON_CERT, socket => {
+      resolve(socket.authorized);
+      socket.end();
+    });
+    server.on("error", reject);
+    server.listen(0);
+    await once(server, "listening");
+    const address = server.address() as AddressInfo;
+    const client = connect({
+      port: address.port,
+      host: "127.0.0.1",
+      rejectUnauthorized: false,
+    });
+    client.on("error", reject);
+    try {
+      expect(await promise).toBe(false);
+    } finally {
+      client.end();
+      server.close();
+    }
+  }
+
+  // The legitimate mutual-TLS case still works: when the server requests a
+  // certificate and the client presents one that verifies against the
+  // server's CA, the socket is reported as authorized.
+  {
+    const fixtures = join(import.meta.dir, "fixtures");
+    const agent1Key = readFileSync(join(fixtures, "agent1-key.pem"), "utf8");
+    const agent1Cert = readFileSync(join(fixtures, "agent1-cert.pem"), "utf8");
+    const ca1 = readFileSync(join(fixtures, "ca1-cert.pem"), "utf8");
+
+    const { promise, resolve, reject } = Promise.withResolvers<boolean>();
+    const server: Server = createServer(
+      {
+        key: agent1Key,
+        cert: agent1Cert,
+        ca: [ca1],
+        requestCert: true,
+        rejectUnauthorized: false,
+      },
+      socket => {
+        resolve(socket.authorized);
+        socket.end();
+      },
+    );
+    server.on("error", reject);
+    server.listen(0);
+    await once(server, "listening");
+    const address = server.address() as AddressInfo;
+    const client = connect({
+      port: address.port,
+      host: "127.0.0.1",
+      key: agent1Key,
+      cert: agent1Cert,
+      ca: [ca1],
+      rejectUnauthorized: false,
+    });
+    client.on("error", reject);
+    try {
+      expect(await promise).toBe(true);
+    } finally {
+      client.end();
+      server.close();
+    }
+  }
 });

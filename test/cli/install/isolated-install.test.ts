@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, readlinkSync } from "fs";
 import { mkdir, readlink, rm, symlink } from "fs/promises";
 import { VerdaccioRegistry, bunEnv, bunExe, readdirSorted, runBunInstall, tempDir } from "harness";
-import { join } from "path";
+import { dirname, join } from "path";
 
 const registry = new VerdaccioRegistry();
 
@@ -1376,8 +1376,69 @@ test("transitive peer deps are resolved when resolution is fully synchronous", a
 });
 
 describe("global virtual store", () => {
-  test("survives node_modules wipe", async () => {
+  // The global virtual store is off by default; tests that exercise it opt
+  // in via bunfig `install.globalStore = true`.
+  const gvsBunfigOpts = { linker: "isolated", globalStore: true } as const;
+
+  test("is disabled by default", async () => {
     const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+
+    await write(
+      packageJson,
+      JSON.stringify({
+        name: "test-pkg-global-store-default-off",
+        dependencies: { "no-deps": "1.0.0" },
+      }),
+    );
+
+    await runBunInstall(bunEnv, packageDir);
+
+    // With the global store disabled (the default) the entry is a real
+    // directory under `node_modules/.bun/` (the pre-global-store layout).
+    const entry = join(packageDir, "node_modules", ".bun", "no-deps@1.0.0");
+    expect(lstatSync(entry).isSymbolicLink()).toBe(false);
+    expect(lstatSync(entry).isDirectory()).toBe(true);
+    expect(existsSync(join(entry, "node_modules", "no-deps", "package.json"))).toBe(true);
+  });
+
+  test("can be enabled via BUN_INSTALL_GLOBAL_STORE=1", async () => {
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+
+    await write(
+      packageJson,
+      JSON.stringify({
+        name: "test-pkg-global-store-on-env",
+        dependencies: { "no-deps": "1.0.0" },
+      }),
+    );
+
+    await runBunInstall({ ...bunEnv, BUN_INSTALL_GLOBAL_STORE: "1" }, packageDir);
+
+    const entry = join(packageDir, "node_modules", ".bun", "no-deps@1.0.0");
+    expect(lstatSync(entry).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(entry)).toMatch(/links[\/\\]no-deps@1\.0\.0-[0-9a-f]{16}$/);
+  });
+
+  test("can be enabled via bunfig install.globalStore", async () => {
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
+
+    await write(
+      packageJson,
+      JSON.stringify({
+        name: "test-pkg-global-store-on-bunfig",
+        dependencies: { "no-deps": "1.0.0" },
+      }),
+    );
+
+    await runBunInstall(bunEnv, packageDir);
+
+    const entry = join(packageDir, "node_modules", ".bun", "no-deps@1.0.0");
+    expect(lstatSync(entry).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(entry)).toMatch(/links[\/\\]no-deps@1\.0\.0-[0-9a-f]{16}$/);
+  });
+
+  test("survives node_modules wipe", async () => {
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1425,8 +1486,72 @@ describe("global virtual store", () => {
     ).toMatchObject({ name: "two-range-deps", version: "1.0.0" });
   });
 
-  test("can be disabled via BUN_INSTALL_GLOBAL_STORE=0", async () => {
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+  test("--force replaces a corrupted global-store entry", async () => {
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
+
+    await write(
+      packageJson,
+      JSON.stringify({
+        name: "test-pkg-global-store-force-heal",
+        dependencies: { "no-deps": "1.0.0" },
+      }),
+    );
+
+    await runBunInstall(bunEnv, packageDir);
+
+    const entry = join(packageDir, "node_modules", ".bun", "no-deps@1.0.0");
+    expect(lstatSync(entry).isSymbolicLink()).toBe(true);
+    const gvsTarget = readlinkSync(entry);
+    const pkgDir = join(gvsTarget, "node_modules", "no-deps");
+    const pkgJsonPath = join(pkgDir, "package.json");
+    const indexPath = join(pkgDir, "index.js");
+    const original = await file(pkgJsonPath).text();
+
+    // Corrupt the published global-store entry: delete files (the directory
+    // still exists, so the warm-hit `directoryExistsAt` check is satisfied
+    // and a plain reinstall takes the symlink-only fast path). The
+    // extraction cache the entry was hardlinked from keeps its own
+    // hardlinks, so the source bytes for --force to rebuild from are intact.
+    await rm(pkgJsonPath, { force: true });
+    await rm(indexPath, { force: true });
+
+    // Sanity: a non-force reinstall does NOT heal — it sees the directory
+    // present and reuses it. (This pins the warm-hit semantics so the
+    // assertion below is meaningful.)
+    await rm(join(packageDir, "node_modules"), { recursive: true, force: true });
+    await runBunInstall(bunEnv, packageDir, { savesLockfile: false });
+    expect(existsSync(pkgJsonPath)).toBe(false);
+
+    // --force must rebuild staging and swap it into place over the corrupt
+    // final directory instead of discarding the fresh tree on EEXIST.
+    await rm(join(packageDir, "node_modules"), { recursive: true, force: true });
+    {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), "install", "--force"],
+        cwd: packageDir,
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).not.toContain("error:");
+      expect(exitCode).toBe(0);
+    }
+
+    expect(readlinkSync(entry)).toBe(gvsTarget);
+    expect(await file(pkgJsonPath).text()).toBe(original);
+    expect(existsSync(indexPath)).toBe(true);
+
+    // The swap-aside `.old-<rand>` tree is removed once publish succeeds, so
+    // the links/ directory is left with only final entries (no `.old-` and no
+    // `.tmp-` siblings).
+    const linksDir = dirname(gvsTarget);
+    const siblings = await readdirSorted(linksDir);
+    expect(siblings.some(n => n.includes(".old-") || n.includes(".tmp-"))).toBe(false);
+  });
+
+  test("BUN_INSTALL_GLOBAL_STORE=0 overrides bunfig globalStore = true", async () => {
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1446,28 +1571,8 @@ describe("global virtual store", () => {
     expect(existsSync(join(entry, "node_modules", "no-deps", "package.json"))).toBe(true);
   });
 
-  test("can be disabled via bunfig install.globalStore", async () => {
-    const { packageJson, packageDir } = await registry.createTestDir({
-      bunfigOpts: { linker: "isolated", globalStore: false },
-    });
-
-    await write(
-      packageJson,
-      JSON.stringify({
-        name: "test-pkg-global-store-off-bunfig",
-        dependencies: { "no-deps": "1.0.0" },
-      }),
-    );
-
-    await runBunInstall(bunEnv, packageDir);
-
-    const entry = join(packageDir, "node_modules", ".bun", "no-deps@1.0.0");
-    expect(lstatSync(entry).isSymbolicLink()).toBe(false);
-    expect(lstatSync(entry).isDirectory()).toBe(true);
-  });
-
   test("entry hash is deterministic across fresh installs", async () => {
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1499,8 +1604,8 @@ describe("global virtual store", () => {
     // versions of one of its transitive deps must NOT share a global entry —
     // the dep symlink inside the entry would point at the wrong version for
     // one of them.
-    const a = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
-    const b = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const a = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
+    const b = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       a.packageJson,
@@ -1541,8 +1646,8 @@ describe("global virtual store", () => {
   });
 
   test("two projects with the same closure share one global entry", async () => {
-    const a = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
-    const b = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const a = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
+    const b = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     for (const { packageJson } of [a, b]) {
       await write(
@@ -1570,7 +1675,7 @@ describe("global virtual store", () => {
     // dangling for any other project that shared the entry. The eligibility
     // check propagates: an entry that links to anything project-local is
     // itself project-local.
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await mkdir(join(packageDir, "packages", "ws-pkg"), { recursive: true });
     await write(
@@ -1599,7 +1704,7 @@ describe("global virtual store", () => {
   });
 
   test("packages with trusted lifecycle scripts stay project-local", async () => {
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1635,15 +1740,15 @@ describe("global virtual store", () => {
     // Two `bun install` processes may race to create the same content-addressed
     // global entry; the loser sees EEXIST from clonefile/symlink/bin-link and
     // must treat it as success rather than failing the install.
-    const a = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
-    const b = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const a = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
+    const b = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     // Both projects must share one cache for the race to be real; the harness
     // gives each test dir its own `.bun-cache/` by default.
     const sharedCache = join(a.packageDir, ".bun-cache");
     await write(
       join(b.packageDir, "bunfig.toml"),
-      `[install]\ncache = "${sharedCache.replaceAll("\\", "\\\\")}"\nregistry = "${registry.registryUrl()}"\nlinker = "isolated"\n`,
+      `[install]\ncache = "${sharedCache.replaceAll("\\", "\\\\")}"\nregistry = "${registry.registryUrl()}"\nlinker = "isolated"\nglobalStore = true\n`,
     );
 
     for (const { packageJson } of [a, b]) {
@@ -1696,7 +1801,7 @@ describe("global virtual store", () => {
     // `<entry>/` as the final step, so a published entry is always complete.
     // A crashed earlier install can leave a staging directory behind; the
     // warm-hit check must look at the final path only.
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1732,7 +1837,7 @@ describe("global virtual store", () => {
     // resolver would then `ReadFile` a directory. Exercising an actual
     // `require()` through a transitive dep proves the chain resolves
     // end-to-end on every platform.
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1777,7 +1882,7 @@ describe("global virtual store", () => {
     // the shared cache. On Windows the `.expect_missing` dep-symlink rewrite
     // then baked a project-absolute junction target into the shared entry,
     // which dangled after `rm -rf node_modules`.
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1819,7 +1924,7 @@ describe("global virtual store", () => {
     // real directory. Re-running install with the global store enabled must
     // replace that directory with a symlink (not fail with EEXIST or leave the
     // stale tree behind).
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1845,7 +1950,7 @@ describe("global virtual store", () => {
     // A subsequent `bun install` (e.g. to add another dep) before `--commit`
     // must not see that real directory as a stale pre-GVS layout and
     // `deleteTree` the user's in-progress edits.
-    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+    const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: gvsBunfigOpts });
 
     await write(
       packageJson,
@@ -1887,4 +1992,37 @@ describe("global virtual store", () => {
     expect(lstatSync(workspace).isSymbolicLink()).toBe(false);
     expect(await file(edited).text()).toBe("module.exports = 'USER_EDITS';\n");
   });
+});
+
+test("rejects dependency aliases that traverse outside node_modules", async () => {
+  const { packageJson, packageDir } = await registry.createTestDir({ bunfigOpts: { linker: "isolated" } });
+
+  // A (transitively) malicious package.json can use an arbitrary string as a
+  // dependency alias. The alias becomes a `node_modules/<alias>` path
+  // component in the isolated store layout, so a `..` segment lets it plant
+  // symlinks outside of node_modules.
+  await write(
+    packageJson,
+    JSON.stringify({
+      name: "test-pkg-unsafe-alias",
+      dependencies: {
+        "../pwned-by-alias": "npm:no-deps@1.0.0",
+      },
+    }),
+  );
+
+  await using proc = spawn({
+    cmd: [bunExe(), "install"],
+    cwd: packageDir,
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+
+  expect(stderr).toContain("is not a valid install folder name");
+  // Nothing may be created outside of node_modules. `lstatSync` instead of
+  // `existsSync` because the escaped artifact would be a dangling symlink.
+  expect(() => lstatSync(join(packageDir, "pwned-by-alias"))).toThrow();
+  expect(exitCode).not.toBe(0);
 });

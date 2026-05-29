@@ -264,6 +264,19 @@ function connectionListener(socket) {
   socket.on("error", socketOnCompatError);
 }
 
+// Node.js only requests a client certificate when `requestCert: true`.
+// The uSockets SSL context treats `ca` alone as "verify peer", so without
+// these two flags an `https.Server({ ca })` would reject every client that
+// doesn't present a cert. Mirror tls.Server (net.ts): default `requestCert`
+// to false and, when not requesting, force `rejectUnauthorized` to false so
+// the CA is loaded into the trust store without requiring a client cert.
+function normalizeServerTls(tls) {
+  const requestCert = !!tls.requestCert;
+  tls.requestCert = requestCert;
+  tls.rejectUnauthorized = requestCert ? tls.rejectUnauthorized !== false : false;
+  return tls;
+}
+
 function Server(options, callback): void {
   if (!(this instanceof Server)) return new Server(options, callback);
   EventEmitter.$call(this);
@@ -331,7 +344,16 @@ function Server(options, callback): void {
     }
 
     if (this[isTlsSymbol]) {
-      this[tlsSymbol] = tlsOptions;
+      this[tlsSymbol] = normalizeServerTls({
+        serverName,
+        key,
+        cert,
+        ca,
+        passphrase,
+        secureOptions,
+        requestCert: options.requestCert,
+        rejectUnauthorized: options.rejectUnauthorized,
+      });
     } else {
       this[tlsSymbol] = null;
     }
@@ -458,7 +480,7 @@ Server.prototype.listen = function () {
 
       const otherTLS = arguments[0].tls;
       if (otherTLS && $isObject(otherTLS)) {
-        tls = otherTLS;
+        tls = normalizeServerTls({ ...otherTLS });
       }
     } else if (typeof arguments[0] === "string" && !(Number(arguments[0]) >= 0)) {
       // (path[...][, cb])
@@ -969,10 +991,26 @@ const NodeHTTPServerSocket = class Socket extends Duplex {
   #onClose() {
     this[kHandle] = null;
 
+    // Node.js's `socketOnClose` → `abortIncoming()` only destroys requests
+    // that are still in `state.incoming` — i.e. requests whose response has
+    // not yet finished (`resOnFinish` does `incoming.shift()`). Our
+    // equivalent of "still in the queue" is `_httpMessage` being non-null:
+    // `detachSocket()` (called from `res.end()` / on `"finish"`) clears it.
+    // Do NOT fall back to `this[kRequest]` here — that slot is never cleared,
+    // so falling back would abort the request on every keep-alive close even
+    // after a fully successful response, which races `req._dump()`'s
+    // nextTick and can surface as a spurious `"aborted"` (seen as flakes in
+    // the express `res.sendFile` suite where supertest closes the socket
+    // right after reading the body).
+    //
+    // Gate on `!req.destroyed` rather than `!req.complete`: a body-less GET
+    // flips `complete` before the response is written, so an aborted
+    // connection would otherwise never reach `req.destroy()` →
+    // `emit("close")` (test-http-should-emit-close-when-connection-is-aborted).
     const message = this._httpMessage;
     const req = message?.req;
 
-    if (req && !req.complete && !req[kHandle]?.upgraded) {
+    if (req && !req.destroyed && !req[kHandle]?.upgraded) {
       // At this point the socket is already destroyed; let's avoid UAF
       req[kHandle] = undefined;
       if (req.listenerCount("error") > 0) {

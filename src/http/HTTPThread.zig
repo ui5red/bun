@@ -196,12 +196,10 @@ fn initOnce(opts: *const InitOpts) void {
         .loop = undefined,
         .http_context = .{
             .ref_count = .init(),
-            .us_socket_context = undefined,
             .pending_sockets = NewHTTPContext(false).PooledSocketHiveAllocator.empty,
         },
         .https_context = .{
             .ref_count = .init(),
-            .us_socket_context = undefined,
             .pending_sockets = NewHTTPContext(true).PooledSocketHiveAllocator.empty,
         },
         .timer = std.time.Timer.start() catch unreachable,
@@ -227,6 +225,18 @@ pub fn onStart(opts: InitOpts) void {
     bun.http.default_arena = Arena.init();
     bun.http.default_allocator = bun.http.default_arena.allocator();
 
+    // uSockets' long-timeout counter is `% 240` minutes (see
+    // `us_socket_long_timeout` in packages/bun-usockets/src/socket.c), so
+    // values above 239 min wrap around and fire early. Clamp here — it's the
+    // only assignment — so the underlying timer can't wrap, and round values
+    // above 240s up to a whole minute so `socket.setTimeout`'s floor-to-
+    // minute long-timer path never yields a timeout *shorter* than requested.
+    // Normalising once here keeps the h1 (`HTTPClient.setTimeout`) and h2
+    // (`ClientSession.rearmTimeout`) paths identical without duplicating the
+    // math at each call site.
+    const raw: u64 = @min(bun.env_var.BUN_CONFIG_HTTP_IDLE_TIMEOUT.get(), 239 * 60);
+    bun.http.idle_timeout_seconds = @intCast(if (raw > 240) ((raw + 59) / 60) * 60 else raw);
+
     const loop = bun.jsc.MiniEventLoop.initGlobal(null, null);
 
     if (Environment.isWindows) {
@@ -243,7 +253,7 @@ pub fn onStart(opts: InitOpts) void {
     bun.http.http_thread.processEvents();
 }
 
-pub fn connect(this: *@This(), client: *HTTPClient, comptime is_ssl: bool) !NewHTTPContext(is_ssl).HTTPSocket {
+pub fn connect(this: *@This(), client: *HTTPClient, comptime is_ssl: bool) !?NewHTTPContext(is_ssl).HTTPSocket {
     if (client.unix_socket_path.length() > 0) {
         return try this.context(is_ssl).connectSocket(client, client.unix_socket_path.slice());
     }
@@ -274,7 +284,6 @@ pub fn connect(this: *@This(), client: *HTTPClient, comptime is_ssl: bool) !NewH
             custom_context.* = .{
                 .ref_count = .init(),
                 .pending_sockets = NewHTTPContext(is_ssl).PooledSocketHiveAllocator.empty,
-                .us_socket_context = undefined,
             };
             custom_context.initWithClientConfig(client) catch |err| {
                 bun.default_allocator.destroy(custom_context);
@@ -360,6 +369,14 @@ fn evictOldestSslContext() void {
     entry.config_ref.deinit();
 }
 
+fn abortPendingH2Waiter(this: *@This(), async_http_id: u32) bool {
+    if (this.https_context.abortPendingH2Waiter(async_http_id)) return true;
+    for (custom_ssl_context_map.values()) |entry| {
+        if (entry.ctx.abortPendingH2Waiter(async_http_id)) return true;
+    }
+    return false;
+}
+
 fn drainQueuedShutdowns(this: *@This()) void {
     while (true) {
         // socket.close() can potentially be slow
@@ -388,15 +405,27 @@ fn drainQueuedShutdowns(this: *@This()) void {
                             client.closeAndAbort(comptime is_tls, socket);
                             continue;
                         }
+                        if (tagged.get(bun.http.H2.ClientSession)) |session| {
+                            session.abortByHttpId(http.async_http_id);
+                            continue;
+                        }
                         socket.close(.failure);
                     },
                 }
             } else {
-                // No socket for this id: the request either hasn't started
-                // yet (still in `queued_tasks`/`deferred_tasks`) or has
-                // already completed. Flag it so `drainEvents` knows to scan
-                // the queue for aborted-but-unstarted tasks even when
-                // `active >= max` would otherwise short-circuit.
+                // No socket for this id. It may be a request coalesced onto a
+                // leader's in-flight h2 TLS connect (parked in `pc.waiters`
+                // with no abort-tracker entry); scan those first so the abort
+                // doesn't wait for the leader's connect to resolve.
+                if (this.abortPendingH2Waiter(http.async_http_id)) continue;
+                // Or it's on an HTTP/3 session, which has no TCP socket to
+                // register in the tracker.
+                if (bun.http.H3.ClientContext.abortByHttpId(http.async_http_id)) continue;
+                // Otherwise the request either hasn't started yet (still in
+                // `queued_tasks`/`deferred_tasks`) or has already completed.
+                // Flag it so `drainEvents` knows to scan the queue for
+                // aborted-but-unstarted tasks even when `active >= max`
+                // would otherwise short-circuit.
                 this.has_pending_queued_abort = true;
             }
         }
@@ -437,8 +466,13 @@ fn drainQueuedWrites(this: *@This()) void {
                                 client.flushStream(is_tls, socket);
                             }
                         }
+                        if (tagged.get(bun.http.H2.ClientSession)) |session| {
+                            session.streamBodyByHttpId(write.async_http_id, ended);
+                        }
                     },
                 }
+            } else {
+                bun.http.H3.ClientContext.streamBodyByHttpId(write.async_http_id, ended);
             }
         }
         if (queued_writes.items.len == 0) {
@@ -471,6 +505,9 @@ fn drainQueuedHTTPResponseBodyDrains(this: *@This()) void {
                         if (tagged.get(HTTPClient)) |client| {
                             client.drainResponseBody(comptime is_tls, socket);
                         }
+                        if (tagged.get(bun.http.H2.ClientSession)) |session| {
+                            session.drainResponseBodyByHttpId(drain.async_http_id);
+                        }
                     },
                 }
             }
@@ -487,6 +524,7 @@ fn drainEvents(this: *@This()) void {
     this.drainQueuedHTTPResponseBodyDrains();
     this.drainQueuedWrites();
     this.drainQueuedShutdowns();
+    bun.http.H3.PendingConnect.drainResolved();
 
     for (this.queued_threadlocal_proxy_derefs.items) |http| {
         http.deref();

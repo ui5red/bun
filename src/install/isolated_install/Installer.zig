@@ -100,6 +100,59 @@ pub const Installer = struct {
         }
     }
 
+    /// Called from main thread when a tarball download or extraction fails.
+    /// Without this, the upfront pending-task slot for each waiting entry is
+    /// never released and the install loop blocks forever on
+    /// `pendingTaskCount() == 0`.
+    pub fn onPackageDownloadError(
+        this: *Installer,
+        task_id: install.Task.Id,
+        name: []const u8,
+        resolution: *const Resolution,
+        err: anyerror,
+        url: []const u8,
+    ) void {
+        if (this.manager.task_queue.fetchRemove(task_id)) |removed| {
+            var callbacks = removed.value;
+            defer callbacks.deinit(this.manager.allocator);
+
+            const entry_steps = this.store.entries.items(.step);
+            for (callbacks.items) |install_ctx| {
+                const entry_id = install_ctx.isolated_package_install_context;
+                entry_steps[entry_id.get()].store(.done, .monotonic);
+                this.onTaskFail(entry_id, .{ .download = .{
+                    .err = err,
+                    .url = url,
+                } });
+            }
+        } else {
+            // No waiting entry — still surface the error so it isn't lost.
+            const string_buf = this.lockfile.buffers.string_bytes.items;
+            Output.errGeneric("failed to download <b>{s}@{f}<r>: {s}\n  <d>{s}<r>", .{
+                name,
+                resolution.fmt(string_buf, .auto),
+                downloadErrorReason(err),
+                url,
+            });
+            Output.flush();
+        }
+    }
+
+    fn downloadErrorReason(e: anyerror) []const u8 {
+        return switch (e) {
+            error.TarballHTTP400 => "400 Bad Request",
+            error.TarballHTTP401 => "401 Unauthorized",
+            error.TarballHTTP402 => "402 Payment Required",
+            error.TarballHTTP403 => "403 Forbidden",
+            error.TarballHTTP404 => "404 Not Found",
+            error.TarballHTTP4xx => "HTTP 4xx",
+            error.TarballHTTP5xx => "HTTP 5xx",
+            error.TarballFailedToExtract => "failed to extract",
+            error.TarballFailedToDownload => "download failed",
+            else => @errorName(e),
+        };
+    }
+
     pub fn applyPackagePatch(this: *Installer, entry_id: Store.Entry.Id, patch: PatchInfo.Patch, log: *bun.logger.Log) void {
         const store = this.store;
         const entry_node_ids = store.entries.items(.node_id);
@@ -164,6 +217,14 @@ pub const Installer = struct {
                 Output.err(bin_err, "failed to link binaries for package: {s}@{f}", .{
                     pkg_name.slice(string_buf),
                     pkg_res.fmt(string_buf, .auto),
+                });
+            },
+            .download => |dl| {
+                Output.errGeneric("failed to download <b>{s}@{f}<r>: {s}\n  <d>{s}<r>", .{
+                    pkg_name.slice(string_buf),
+                    pkg_res.fmt(string_buf, .auto),
+                    downloadErrorReason(dl.err),
+                    dl.url,
                 });
             },
             else => {},
@@ -384,6 +445,7 @@ pub const Installer = struct {
             run_scripts: anyerror,
             binaries: anyerror,
             patching: bun.logger.Log,
+            download: struct { err: anyerror, url: []const u8 },
 
             pub fn clone(this: *const Error, allocator: std.mem.Allocator) Error {
                 return switch (this.*) {
@@ -392,6 +454,7 @@ pub const Installer = struct {
                     .binaries => |err| .{ .binaries = err },
                     .run_scripts => |err| .{ .run_scripts = err },
                     .patching => |log| .{ .patching = log },
+                    .download => |dl| .{ .download = dl },
                 };
             }
         };
@@ -1645,21 +1708,62 @@ pub const Installer = struct {
         switch (sys.renameat(FD.cwd(), staging.sliceZ(), FD.cwd(), final.sliceZ())) {
             .result => return .success,
             .err => |err| {
-                const collided = switch (err.getErrno()) {
-                    .EXIST, .NOTEMPTY => true,
-                    // Windows maps a rename onto an in-use directory to
-                    // ERROR_ACCESS_DENIED; on POSIX PERM/ACCES are real
-                    // permission failures and must propagate.
-                    .PERM, .ACCES => Environment.isWindows,
-                    else => false,
-                };
+                if (!isRenameCollision(err)) {
+                    FD.cwd().deleteTree(staging.slice()) catch {};
+                    return .initErr(err);
+                }
+                // Under --force, the existing entry may be the corrupt one
+                // we were asked to replace. Swap it aside (atomic from a
+                // reader's POV: `final` is always either the old or the new
+                // tree, never missing), publish staging, then GC the old
+                // tree. Without --force, the existing entry came from a
+                // concurrent install and is content-identical — keep it and
+                // discard ours.
+                if (this.manager.options.enable.force_install) {
+                    var old: bun.AbsPath(.{ .sep = .auto }) = .init();
+                    defer old.deinit();
+                    old.append(this.global_store_path.?);
+                    old.appendFmt("{f}.old-{x}", .{
+                        Store.Entry.fmtGlobalStorePath(entry_id, this.store, this.lockfile),
+                        bun.fastRandom(),
+                    });
+                    if (sys.renameat(FD.cwd(), final.sliceZ(), FD.cwd(), old.sliceZ()).asErr()) |swap_err| {
+                        FD.cwd().deleteTree(staging.slice()) catch {};
+                        return .initErr(swap_err);
+                    }
+                    switch (sys.renameat(FD.cwd(), staging.sliceZ(), FD.cwd(), final.sliceZ())) {
+                        .result => {
+                            FD.cwd().deleteTree(old.slice()) catch {};
+                            return .success;
+                        },
+                        .err => |publish_err| {
+                            // Another --force install raced us in the window
+                            // between swap-out and publish. Theirs is fresh
+                            // too; clean up both temp trees.
+                            FD.cwd().deleteTree(staging.slice()) catch {};
+                            FD.cwd().deleteTree(old.slice()) catch {};
+                            return if (isRenameCollision(publish_err)) .success else .initErr(publish_err);
+                        },
+                    }
+                }
                 FD.cwd().deleteTree(staging.slice()) catch {};
                 // A concurrent install renamed first; both writers produced
                 // the same content-addressed bytes, so theirs is as good as
                 // ours.
-                return if (collided) .success else .initErr(err);
+                return .success;
             },
         }
+    }
+
+    fn isRenameCollision(err: sys.Error) bool {
+        return switch (err.getErrno()) {
+            .EXIST, .NOTEMPTY => true,
+            // Windows maps a rename onto an in-use directory to
+            // ERROR_ACCESS_DENIED; on POSIX PERM/ACCES are real
+            // permission failures and must propagate.
+            .PERM, .ACCES => Environment.isWindows,
+            else => false,
+        };
     }
 
     /// Project-local path `node_modules/.bun/<storepath>` (the symlink that
